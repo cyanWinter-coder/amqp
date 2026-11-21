@@ -30,6 +30,11 @@ type Channel struct {
 	confirmM   sync.Mutex // publisher confirms state mutex
 	notifyM    sync.RWMutex
 
+	// sendM guards inFlight and the deferred release of this generation's id.
+	// It is never held across a write to the connection, so a slow transport
+	// can never block the connection's reader through it.
+	sendM sync.Mutex
+
 	connection *Connection
 
 	rpc       chan message
@@ -37,8 +42,61 @@ type Channel struct {
 
 	id uint16
 
+	// generation is the monotonic allocation generation assigned by the
+	// connection's allocator when this channel was allocated.  It is unique
+	// among every channel ever allocated on the connection, including other
+	// instances that were later given the same id.  It is used to make sure a
+	// closed channel can never act on, or be handed frames for, an id that has
+	// since been reallocated.
+	generation uint64
+
 	// closed is set to 1 when the channel has been closed - see Channel.send()
 	closed int32
+
+	// retired is set to 1 by the connection when this generation stops
+	// owning its id, either because it was released or because the connection
+	// shut down.  It is checked by Channel.send so a method invoked after the
+	// channel was closed can never be written to an id that has since been
+	// (or is about to be) handed to another generation.
+	retired int32
+
+	// inFlight counts sends that passed the retired check and may still be
+	// writing frames.  The id is not returned to the allocator until this
+	// drops to zero, so a new generation can never share the id with frames
+	// still being written for this one.
+	inFlight int
+
+	// releasePending records that this generation has been retired while
+	// sends were still in flight.  The last one to finish releases the id.
+	releasePending bool
+
+	// done is closed once the channel has shut down.  Dispatch selects on it
+	// so a frame that races a close can never block the connection's reader
+	// goroutine on a waiter that has already gone away.
+	done chan struct{}
+
+	// established is set to 1 once the server has answered channel.open.  A
+	// freshly allocated id may be a recycled id and the server may still have
+	// frames queued for its previous generation; only the open reply is
+	// routable before this is set, so those late frames are dropped rather
+	// than delivered to the new instance.
+	established int32
+
+	// recycled is set when this channel was allocated an id that a previous
+	// generation has already owned.  For a recycled id every frame that
+	// precedes the open reply may belong to the previous generation, so
+	// dispatch must not trust anything but the open reply until this
+	// generation is established.  An id that has never been used cannot
+	// receive stale frames, and its open failures keep their server-reported
+	// error.
+	recycled bool
+
+	// abandoned is set when the channel's open is failed locally because of
+	// an ambiguous frame received on a recycled id before its open reply.
+	// The id is not returned to the allocator in that case: the server may
+	// still send an open-ok for this generation, and reusing the id would let
+	// that late reply be mistaken for a later generation's open-ok.
+	abandoned int32
 
 	// true when we will never notify again
 	noNotify bool
@@ -84,12 +142,15 @@ func newChannel(c *Connection, id uint16) *Channel {
 		confirms:   newConfirms(),
 		recv:       (*Channel).recvMethod,
 		errors:     make(chan *Error, 1),
+		done:       make(chan struct{}),
 	}
 }
 
 // shutdown is called by Connection after the channel has been removed from the
 // connection registry.
 func (ch *Channel) shutdown(e *Error) {
+	ch.markRetired()
+
 	ch.destructor.Do(func() {
 		ch.m.Lock()
 		defer ch.m.Unlock()
@@ -144,6 +205,7 @@ func (ch *Channel) shutdown(e *Error) {
 		}
 
 		close(ch.errors)
+		close(ch.done)
 		ch.noNotify = true
 	})
 }
@@ -153,12 +215,141 @@ func (ch *Channel) shutdown(e *Error) {
 // After the channel has been closed, send calls Channel.sendClosed(), ensuring
 // only 'channel.close' is sent to the server.
 func (ch *Channel) send(msg message) (err error) {
+	// Once this generation no longer owns its id, nothing may be written on
+	// the id again: it may already belong to a different Channel instance.
+	if ch.isRetired() {
+		return ErrClosed
+	}
+
+	// Take a reference before writing.  Retirement is ordered after this check
+	// and before the id is handed back to the allocator, so either the write is
+	// ordered before any new generation of the id, or it fails without writing.
+	// This covers the channel-close-ok reply too, which is still a write on the
+	// id and must not straddle a reuse.
+	if !ch.beginSend() {
+		return ErrClosed
+	}
+	defer ch.endSend()
+
 	// If the channel is closed, use Channel.sendClosed()
-	if atomic.LoadInt32(&ch.closed) == 1 {
+	if ch.isShutdown() {
 		return ch.sendClosed(msg)
 	}
 
 	return ch.sendOpen(msg)
+}
+
+// beginSend registers a send in flight.  It reports false when the generation
+// was retired after the caller's check, in which case nothing may be written.
+func (ch *Channel) beginSend() bool {
+	ch.sendM.Lock()
+	defer ch.sendM.Unlock()
+
+	if ch.isRetired() {
+		return false
+	}
+
+	ch.inFlight++
+	return true
+}
+
+// endSend drops a send registered by beginSend and releases the id if this
+// generation was retired while it was in flight.
+func (ch *Channel) endSend() {
+	ch.sendM.Lock()
+	ch.inFlight--
+
+	release := ch.releasePending && ch.inFlight == 0
+	if release {
+		ch.releasePending = false
+	}
+	ch.sendM.Unlock()
+
+	if release {
+		if ch.connection != nil {
+			ch.connection.finishRelease(ch)
+		}
+	}
+}
+
+// isShutdown reports whether this instance has entered shutdown.
+func (ch *Channel) isShutdown() bool {
+	return atomic.LoadInt32(&ch.closed) == 1
+}
+
+// isRetired reports whether the connection has taken this generation's id
+// away from it.
+func (ch *Channel) isRetired() bool {
+	return atomic.LoadInt32(&ch.retired) == 1
+}
+
+// acceptsFrame reports whether f may be delivered to this channel.
+//
+// An id that has never been allocated cannot be the target of a late frame for
+// an earlier generation, so frames are accepted as before.  A recycled id can:
+// the server writes every frame of the previous generation before its reply to
+// this open, so until this generation is established only the open reply is
+// trusted.  Everything else is dropped rather than corrupting this generation's
+// state machine, being handed to its consumers or satisfying one of its waiters.
+func (ch *Channel) acceptsFrame(f frame) bool {
+	if ch.isEstablished() || !ch.recycled {
+		return true
+	}
+
+	mf, ok := f.(*methodFrame)
+	if !ok {
+		return false
+	}
+
+	_, ok = mf.Method.(*channelOpenOk)
+	return ok
+}
+
+// isEstablished reports whether the server has answered this generation's
+// channel.open.
+func (ch *Channel) isEstablished() bool {
+	return atomic.LoadInt32(&ch.established) == 1
+}
+
+// retire stops this generation from owning its id.  It reports whether the id
+// was released immediately; if it returns false, sends were still in flight and
+// the last one to finish calls Connection.finishRelease.
+//
+// Retirement and the id's release are ordered against Channel.send: a send
+// either registers before retire is called, and is therefore finished (or
+// pending) before the id is handed out again, or it observes the retired flag
+// and fails without writing.
+func (ch *Channel) retire() bool {
+	ch.markRetired()
+
+	ch.sendM.Lock()
+	defer ch.sendM.Unlock()
+
+	if ch.inFlight > 0 {
+		ch.releasePending = true
+		return false
+	}
+
+	return true
+}
+
+// markRetired stops new sends from registering.  It is idempotent and is also
+// called as soon as a channel shuts down, before any of its teardown, so a
+// method invoked after the close can never be written on the id.
+func (ch *Channel) markRetired() {
+	atomic.StoreInt32(&ch.retired, 1)
+}
+
+// markAbandoned records that this generation's id must not be reused, because
+// an ambiguous reply may still arrive for it.
+func (ch *Channel) markAbandoned() {
+	atomic.StoreInt32(&ch.abandoned, 1)
+}
+
+// isAbandoned reports whether this generation's id must stay out of the
+// allocator for the lifetime of the connection.
+func (ch *Channel) isAbandoned() bool {
+	return atomic.LoadInt32(&ch.abandoned) == 1
 }
 
 func (ch *Channel) open() error {
@@ -273,6 +464,12 @@ func (ch *Channel) sendOpen(msg message) (err error) {
 // goroutine, so assumes serialized access.
 func (ch *Channel) dispatch(msg message) {
 	switch m := msg.(type) {
+	case *channelOpenOk:
+		// Mark the generation established before handing the reply to the
+		// waiter so frames that follow it on the wire are routed normally.
+		atomic.StoreInt32(&ch.established, 1)
+		ch.deliverRPC(m)
+
 	case *channelClose:
 		// lock before sending connection.close-ok
 		// to avoid unexpected interleaving with basic.publish frames if
@@ -330,7 +527,20 @@ func (ch *Channel) dispatch(msg message) {
 		// deliveries are in flight and a no-wait cancel has happened
 
 	default:
-		ch.rpc <- msg
+		ch.deliverRPC(msg)
+	}
+}
+
+// deliverRPC hands a synchronous reply to the channel's current waiter.
+//
+// If the channel shut down while the reply was in flight the waiter has already
+// returned via shutdown, so the reply is dropped.  This both keeps a late reply
+// from satisfying a later RPC on a reused id and stops the connection's reader
+// goroutine blocking on a waiter that has gone away.
+func (ch *Channel) deliverRPC(msg message) {
+	select {
+	case ch.rpc <- msg:
+	case <-ch.done:
 	}
 }
 

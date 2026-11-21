@@ -88,8 +88,18 @@ type Connection struct {
 	sends     chan time.Time     // timestamps of each frame sent
 	deadlines chan readDeadliner // heartbeater updates read deadlines
 
-	allocator *allocator // id generator valid after openTune
-	channels  map[uint16]*Channel
+	// allocator is the id and generation generator, valid after openTune.  It
+	// is nil once the connection has been shut down, which makes
+	// allocateChannel reject allocations that were not committed.
+	allocator *allocator
+	// channels maps a live id to the one channel that currently owns it.
+	// retired remembers the generation that last owned an id once it has been
+	// released.  Together with Channel.generation this lets dispatch tell a
+	// frame for a released generation apart from a frame for a channel that
+	// has not been allocated yet.  Both are guarded by c.m.
+	channels    map[uint16]*Channel
+	retired     map[uint16]uint64
+	staleFrames uint64 // frames dropped because their generation was retired
 
 	noNotify bool // true when we will never notify again
 	closes   []chan *Error
@@ -225,6 +235,7 @@ func Open(conn io.ReadWriteCloser, config Config) (*Connection, error) {
 		conn:      conn,
 		writer:    &writer{bufio.NewWriter(conn)},
 		channels:  make(map[uint16]*Channel),
+		retired:   make(map[uint16]uint64),
 		rpc:       make(chan message),
 		sends:     make(chan time.Time),
 		errors:    make(chan *Error, 1),
@@ -388,7 +399,6 @@ func (c *Connection) shutdown(err *Error) {
 
 	c.destructor.Do(func() {
 		c.m.Lock()
-		defer c.m.Unlock()
 
 		if err != nil {
 			for _, c := range c.closes {
@@ -410,20 +420,37 @@ func (c *Connection) shutdown(err *Error) {
 			close(c)
 		}
 
-		// Shutdown the channel, but do not use closeChannel() as it calls
+		// Shutdown the channels, but do not use closeChannel() as it calls
 		// releaseChannel() which requires the connection lock.
 		//
-		// Ranging over c.channels and calling releaseChannel() that mutates
-		// c.channels is racy - see commit 6063341 for an example.
-		for _, ch := range c.channels {
+		// Snapshot the registry under c.m instead of ranging over c.channels
+		// while releaseChannel() may be mutating it - see commit 6063341 for
+		// an example.
+		//
+		// Retire every id that is still allocated and drop the allocator, so
+		// every uncommitted allocation (and every future one) is rejected
+		// rather than handed an id after the connection is gone.
+		allocated := make([]*Channel, 0, len(c.channels))
+		for id, ch := range c.channels {
+			allocated = append(allocated, ch)
+			c.retired[id] = ch.generation
+			ch.markRetired()
+		}
+		c.channels = map[uint16]*Channel{}
+		c.allocator = nil
+		c.noNotify = true
+
+		c.m.Unlock()
+
+		// Shut the channels down outside the connection lock: shutting a
+		// channel down runs its notify listeners, and there is no need to wait
+		// for in-flight writes because the id is never reallocated once the
+		// connection is gone.
+		for _, ch := range allocated {
 			ch.shutdown(err)
 		}
 
 		c.conn.Close()
-
-		c.channels = map[uint16]*Channel{}
-		c.allocator = newAllocator(1, c.Config.ChannelMax)
-		c.noNotify = true
 	})
 }
 
@@ -469,15 +496,120 @@ func (c *Connection) dispatch0(f frame) {
 }
 
 func (c *Connection) dispatchN(f frame) {
+	id := f.channel()
+
 	c.m.Lock()
-	channel := c.channels[f.channel()]
+	channel := c.channels[id]
+	_, retired := c.retired[id]
 	c.m.Unlock()
 
-	if channel != nil {
-		channel.recv(channel, f)
+	if channel != nil && channel.isRetired() {
+		// The channel has shut down but its id has not been returned to the
+		// allocator yet.  It must no longer receive frames, but a concurrent
+		// channel.close still needs its close-ok; dispatchStale answers it
+		// without touching the retired instance.
+		c.dispatchStale(f)
+	} else if channel != nil {
+		// The registry only ever holds the generation that currently owns an
+		// id, so a frame is delivered to the live owner and never to an
+		// instance that has already been shut down and replaced.  Until that
+		// owner has completed channel.open, however, frames still queued on
+		// the wire may belong to the previous generation of this recycled id
+		// and are handled as stale instead.
+		if channel.acceptsFrame(f) {
+			channel.recv(channel, f)
+		} else {
+			c.dispatchStale(f)
+			c.abortRecycledOpen(channel, f)
+		}
+	} else if retired {
+		c.dispatchStale(f)
 	} else {
 		c.dispatchClosed(f)
 	}
+}
+
+// abortRecycledOpen fails a channel whose recycled id received a frame other
+// than its open reply before that reply arrived.
+//
+// Such a frame may belong to the previous generation (and has already been
+// dropped by dispatchStale) or be the server rejecting this open.  Either way
+// the new instance must not stay blocked forever waiting for an open reply that
+// may never come, so a channel.close fails the open locally and reports the
+// server's reason when it sent one.
+//
+// The id is abandoned rather than released: if the close belonged to the
+// previous generation, the server may still answer this open, and handing the
+// id to a new generation could let that late open-ok be taken as its own.
+func (c *Connection) abortRecycledOpen(channel *Channel, f frame) {
+	mf, ok := f.(*methodFrame)
+	if !ok {
+		return
+	}
+	m, closing := mf.Method.(*channelClose)
+	if !closing {
+		return
+	}
+
+	c.abandonChannel(channel, newError(m.ReplyCode, m.ReplyText))
+}
+
+// abandonChannel unregisters a channel without returning its id to the
+// allocator, so the id is never reused for the lifetime of the connection.
+func (c *Connection) abandonChannel(ch *Channel, e *Error) {
+	ch.markAbandoned()
+
+	c.m.Lock()
+	current, ok := c.channels[ch.id]
+	if ok && current == ch && current.generation == ch.generation {
+		delete(c.channels, ch.id)
+		c.retired[ch.id] = ch.generation
+	}
+	c.m.Unlock()
+
+	ch.markRetired()
+	ch.shutdown(e)
+}
+
+// dispatchStale handles a frame whose generation no longer owns its id.
+//
+// The frame must never reach a Channel instance: the old one has been shut
+// down and the id may since have been allocated to a new one.  A close still
+// needs its close-ok so the server does not keep the channel half-open, but
+// everything else is dropped and accounted for instead of being treated as a
+// protocol violation that would tear down the whole connection.
+func (c *Connection) dispatchStale(f frame) {
+	c.recordStaleFrame()
+
+	mf, ok := f.(*methodFrame)
+	if !ok {
+		return
+	}
+
+	switch mf.Method.(type) {
+	case *channelClose:
+		// The peer closed the channel concurrently with us.  It must still
+		// receive a close-ok, but the reply belongs to the connection, not to
+		// the stale (or newly allocated) channel.
+		c.send(&methodFrame{
+			ChannelId: f.channel(),
+			Method:    &channelCloseOk{},
+		})
+	case *channelCloseOk:
+		// We already closed this generation, so there is nothing to do.
+	default:
+		// Any other method for a retired generation is late traffic from a
+		// channel that has already ended.  Dropping it keeps it away from a
+		// channel that may later reuse the id.
+	}
+}
+
+// recordStaleFrame accounts for a frame dropped because it belonged to a
+// generation that no longer owns its id.
+func (c *Connection) recordStaleFrame() {
+	c.m.Lock()
+	c.staleFrames++
+	c.m.Unlock()
 }
 
 // section 2.3.7: "When a peer decides to close a channel or connection, it
@@ -601,29 +733,88 @@ func (c *Connection) allocateChannel() (*Channel, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
 
-	if c.IsClosed() {
+	if c.IsClosed() || c.allocator == nil {
 		return nil, ErrClosed
 	}
 
-	id, ok := c.allocator.next()
+	id, generation, ok := c.allocator.nextGeneration()
 	if !ok {
 		return nil, ErrChannelMax
 	}
 
 	ch := newChannel(c, uint16(id))
+	ch.generation = generation
+	// If this id was owned before, the wire may still carry frames for that
+	// generation until this channel's open reply arrives.
+	_, ch.recycled = c.retired[uint16(id)]
 	c.channels[uint16(id)] = ch
+	// The id now belongs to a live generation, so it is no longer retired.
+	delete(c.retired, uint16(id))
 
 	return ch, nil
 }
 
 // releaseChannel removes a channel from the registry as the final part of the
-// channel lifecycle
-func (c *Connection) releaseChannel(id uint16) {
+// channel lifecycle.
+//
+// Release is idempotent and generation-aware: it is a no-op unless the given
+// generation is the one that currently owns the id.  A repeated release, or a
+// stale close of an older generation, therefore cannot unregister or free the
+// newer channel that has since been allocated the same id.  Generations only
+// advance on allocation, so a release never advances or rewinds them.
+func (c *Connection) releaseChannel(ch *Channel) {
+	c.m.Lock()
+	current, ok := c.channels[ch.id]
+	owns := ok && current == ch && current.generation == ch.generation
+	if owns {
+		delete(c.channels, ch.id)
+		// Remember the generation that owned this id so frames that arrive
+		// after the release are recognised as stale instead of being answered
+		// as a protocol violation on an unallocated id.
+		c.retired[ch.id] = ch.generation
+	}
+	c.m.Unlock()
+
+	if !owns {
+		return
+	}
+
+	// An abandoned id is never reused: a late open-ok may still arrive for
+	// it, and the allocator must not hand the id to another generation.
+	if ch.isAbandoned() {
+		return
+	}
+
+	// Retire outside the connection lock.  It only takes the channel's send
+	// lock briefly, and the id is not returned to the allocator until every
+	// send that started before this point has finished (finishRelease), so a
+	// late write can never land on a new generation of the same id.
+	if ch.retire() {
+		c.finishRelease(ch)
+	}
+}
+
+// finishRelease returns an id to the allocator once its generation is retired
+// and no send of that generation is in flight any more.
+func (c *Connection) finishRelease(ch *Channel) {
 	c.m.Lock()
 	defer c.m.Unlock()
 
-	delete(c.channels, id)
-	c.allocator.release(int(id))
+	// If the connection shut down in the meantime the allocator is gone and
+	// there is nothing to release; releasing into a fresh allocator would
+	// resurrect a channel id after teardown.
+	if c.allocator == nil {
+		return
+	}
+
+	// Only release if the id is still retired for this generation.  A newer
+	// allocation of the id clears the retired entry, so a deferred release
+	// that races a new allocation cannot free that new owner's id.
+	if generation, retired := c.retired[ch.id]; !retired || generation != ch.generation {
+		return
+	}
+
+	c.allocator.release(int(ch.id))
 }
 
 // openChannel allocates and opens a channel, must be paired with closeChannel
@@ -634,7 +825,7 @@ func (c *Connection) openChannel() (*Channel, error) {
 	}
 
 	if err := ch.open(); err != nil {
-		c.releaseChannel(ch.id)
+		c.releaseChannel(ch)
 		return nil, err
 	}
 	return ch, nil
@@ -645,7 +836,7 @@ func (c *Connection) openChannel() (*Channel, error) {
 // this connection.
 func (c *Connection) closeChannel(ch *Channel, e *Error) {
 	ch.shutdown(e)
-	c.releaseChannel(ch.id)
+	c.releaseChannel(ch)
 }
 
 /*
@@ -826,7 +1017,9 @@ func (c *Connection) openComplete() error {
 		_ = deadliner.SetDeadline(time.Time{})
 	}
 
+	c.m.Lock()
 	c.allocator = newAllocator(1, c.Config.ChannelMax)
+	c.m.Unlock()
 	return nil
 }
 
